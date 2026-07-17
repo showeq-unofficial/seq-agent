@@ -1,0 +1,19 @@
+[package]
+name = "seq-agent"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0"
+description = "Minimal EverQuest packet-capture forwarder for the ShowEQ daemon"
+authors = ["ShowEQ Developers"]
+rust-version = "1.75"
+
+[dependencies]
+pcap = "2"
+
+# Tiny static binary is the whole point (router / UDM deploy).
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
