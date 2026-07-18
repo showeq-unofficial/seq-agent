@@ -1,4 +1,5 @@
 /target
+/dist
 # Capture data is developer-local, never committed.
 *.pcap
 *.pcapng

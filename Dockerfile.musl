@@ -1,0 +1,49 @@
+# Cross-build a fully static musl `seq-agent` for arm64/armv7/x86_64 routers
+# (UDM, GL.iNet, Raspberry Pi, …). Parameterized over the musl target.
+#
+# The crux is libpcap: the `pcap` crate link-binds it (`#[link(name="pcap")]`),
+# so a static musl binary needs a static `libpcap.a` for the target. We
+# cross-build a minimal one here (no dbus/libnl/rdma/bluetooth/usb backends) and
+# let the musl static-CRT default resolve `-lpcap` to the archive.
+#
+# Defaults produce aarch64. Override for other arches, e.g.:
+#   docker build -f Dockerfile.musl \
+#     --build-arg RUST_MUSL_CROSS_TAG=armv7-musleabihf \
+#     --build-arg TARGET=armv7-unknown-linux-musleabihf -t seq-agent-armv7 .
+#
+# Extract: id=$(docker create <image>); docker cp $id:/seq-agent .; docker rm $id
+ARG RUST_MUSL_CROSS_TAG=aarch64-musl
+FROM messense/rust-musl-cross:${RUST_MUSL_CROSS_TAG} AS build
+
+ARG LIBPCAP_VERSION=1.10.4
+ARG TARGET=aarch64-unknown-linux-musl
+
+# libpcap's BPF filter compiler needs flex + bison at build time.
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends flex bison \
+ && rm -rf /var/lib/apt/lists/*
+
+# Minimal static libpcap.a for ${TARGET}. The messense image provides the
+# matching cross gcc as `${TARGET}-gcc`.
+RUN curl -fsSL "https://www.tcpdump.org/release/libpcap-${LIBPCAP_VERSION}.tar.gz" -o /tmp/libpcap.tar.gz \
+ && tar -C /tmp -xzf /tmp/libpcap.tar.gz \
+ && cd "/tmp/libpcap-${LIBPCAP_VERSION}" \
+ && CC="${TARGET}-gcc" \
+    ./configure --host="${TARGET}" \
+      --prefix=/opt/libpcap \
+      --enable-static --disable-shared \
+      --without-libnl --disable-dbus --disable-rdma \
+      --disable-bluetooth --disable-usb --disable-netmap \
+ && make -j"$(nproc)" \
+ && make install \
+ && rm -rf /tmp/libpcap*
+
+ENV LIBPCAP_LIBDIR=/opt/libpcap/lib \
+    LIBPCAP_VER=${LIBPCAP_VERSION}
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --target "${TARGET}" --bin seq-agent \
+ && cp "target/${TARGET}/release/seq-agent" /seq-agent

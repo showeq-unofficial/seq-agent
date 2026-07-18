@@ -26,4 +26,6 @@ seq-agent --input fixture.pcap --to 127.0.0.1:9099
 
 Capture data (`*.pcap`/`*.vpk`) is gitignored — never commit session bytes.
 
-Not yet built (later increments): AF_PACKET fast path, Windows/Npcap CI, aarch64-musl release + UDM run, extracting `proto` into a crate the daemon-side reader shares.
+Cross-build (static musl for routers): `Dockerfile.musl` cross-builds a minimal static `libpcap.a` (base `messense/rust-musl-cross`, needs flex+bison), then links it — `pcap` link-binds via `#[link(name="pcap")]`, honors `LIBPCAP_LIBDIR`+`LIBPCAP_VER`; providing only the `.a` + musl static-CRT gives a fully static binary (~709 KB aarch64, verified). Parameterized by `RUST_MUSL_CROSS_TAG`+`TARGET`. Run `sudo bash scripts/build-aarch64.sh [target tag]` → `dist/`. **docker needs sudo here** (user not in `docker` group). CI (`.github/workflows/ci.yml`): fast native fmt/clippy/test/build gate on push+PR; heavy 3-arch musl matrix (aarch64/armv7/x86_64) on tags+dispatch, artifacts attached to the GitHub Release.
+
+Not yet built (later increments): actual UDM run, AF_PACKET fast path, Windows/Npcap CI, extracting `proto` into a crate the daemon-side reader shares.

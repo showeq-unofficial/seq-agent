@@ -55,6 +55,30 @@ seq-agent --input some.pcap --to 127.0.0.1:9099
 tcpdump -r /tmp/out.pcap
 ```
 
+## Cross-build a static binary for a router (aarch64 / armv7 / x86_64)
+
+The target build is a **fully static musl** binary (libpcap + libc baked in, no
+runtime dependencies) — drop it on the box and run. libpcap is cross-built inside
+Docker via [`Dockerfile.musl`](Dockerfile.musl):
+
+```sh
+# aarch64 (UDM, Pi, GL.iNet arm64) — outputs dist/seq-agent-aarch64-unknown-linux-musl
+sudo bash scripts/build-aarch64.sh
+
+# other arches:
+sudo bash scripts/build-aarch64.sh armv7-unknown-linux-musleabihf armv7-musleabihf
+sudo bash scripts/build-aarch64.sh x86_64-unknown-linux-musl       x86_64-musl
+```
+
+CI builds all three on tags (`v*`) and attaches them to the GitHub Release; it
+also builds on manual dispatch. Deploy to a router (running as root avoids
+`setcap`), pointing `--device` at the LAN bridge for whole-network vantage:
+
+```sh
+scp dist/seq-agent-aarch64-unknown-linux-musl root@<udm-ip>:/tmp/seq-agent
+ssh root@<udm-ip> '/tmp/seq-agent --device br0 --no-promisc --to <dev-host>:9099'
+```
+
 ## SEQA wire protocol
 
 TCP, little-endian, pcap-shaped so a stream converts to/from a `.pcap` file with
