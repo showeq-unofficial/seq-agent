@@ -4,17 +4,19 @@
 //! streams timestamped raw frames over TCP using the SEQA protocol. No decode,
 //! no state, no protocol knowledge — so it never needs updating on patch day.
 //!
-//! Two threads: capture (this thread) fills a bounded ring; a sender thread
-//! (re)connects to the consumer and drains it. Live capture drops the oldest
-//! frame when the ring is full (never stalls the NIC); file input backpressures
-//! instead (faithful replay).
+//! The agent is the TCP *listener*: it binds a port and waits for a daemon to
+//! dial in, so the agent needs zero config about where the daemon lives — all
+//! the topology sits in the daemon. Two threads: capture (this thread) fills a
+//! bounded ring; a serve thread accepts a daemon connection and drains the ring
+//! to it, waiting for the next daemon on disconnect. Live capture drops the
+//! oldest frame when the ring is full (never stalls the NIC); file input
+//! backpressures instead (faithful replay).
 
 use std::collections::VecDeque;
 use std::io::{self, BufWriter, Write};
-use std::net::TcpStream;
+use std::net::TcpListener;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use pcap::{Activated, Capture, Device};
 use seq_agent::proto::{FrameHeader, Hello};
@@ -24,7 +26,7 @@ struct Frame {
     data: Vec<u8>,
 }
 
-// ---- bounded ring between the capture thread and the sender thread ----
+// ---- bounded ring between the capture thread and the serve thread ----
 
 struct Ring {
     m: Mutex<Inner>,
@@ -118,48 +120,41 @@ impl Ring {
     }
 }
 
-// ---- sender thread: connect (with backoff), send hello, pump frames ----
+// ---- serve thread: accept a daemon, send hello, pump frames ----
 
-fn sender_loop(ring: &Ring, hello: Hello, addr: String) {
-    loop {
+fn serve_loop(ring: &Ring, hello: Hello, listener: TcpListener) {
+    for conn in listener.incoming() {
         if ring.is_done() {
             return;
         }
-        let stream = match connect(&addr, ring) {
-            Some(s) => s,
-            None => return,
+        let stream = match conn {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[seq-agent] accept error: {e}");
+                continue;
+            }
         };
-        eprintln!("[seq-agent] connected to {addr}");
+        let _ = stream.set_nodelay(true);
+        let peer = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        eprintln!("[seq-agent] daemon connected from {peer}");
         let mut w = BufWriter::new(stream);
         let res = hello
             .write_to(&mut w)
             .and_then(|_| w.flush())
             .and_then(|_| pump(&mut w, ring));
         match res {
+            // pump returns Ok only when the ring is closed and drained, i.e. a
+            // file replay finished — nothing left to serve, so we're done.
             Ok(()) => {
                 eprintln!("[seq-agent] all frames delivered");
                 return;
             }
-            Err(e) => eprintln!("[seq-agent] connection lost: {e}; reconnecting"),
-        }
-    }
-}
-
-fn connect(addr: &str, ring: &Ring) -> Option<TcpStream> {
-    let mut backoff = Duration::from_millis(200);
-    loop {
-        match TcpStream::connect(addr) {
-            Ok(s) => {
-                let _ = s.set_nodelay(true);
-                return Some(s);
-            }
-            Err(_) => {
-                if ring.is_done() {
-                    return None;
-                }
-                thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-            }
+            // Live capture keeps filling the ring across the gap (drop-oldest);
+            // wait for the next daemon to dial in.
+            Err(e) => eprintln!("[seq-agent] daemon disconnected: {e}; waiting for next"),
         }
     }
 }
@@ -200,23 +195,23 @@ fn run<T: Activated>(mut cap: Capture<T>, opts: &Opts) -> Result<(), Box<dyn std
         snaplen: opts.snaplen,
         filter: opts.filter.clone(),
     };
+    let listener = TcpListener::bind(&opts.listen)?;
     eprintln!(
-        "[seq-agent] link_type={link_type} snaplen={} filter={} -> {}",
+        "[seq-agent] link_type={link_type} snaplen={} filter={} listening on {} (waiting for daemon)",
         opts.snaplen,
         if opts.filter.is_empty() {
             "<none>"
         } else {
             &opts.filter
         },
-        opts.to
+        opts.listen
     );
 
     let ring = Arc::new(Ring::new(opts.ring, opts.input.is_some()));
-    let sender = {
+    let server = {
         let r = ring.clone();
-        let addr = opts.to.clone();
         let hello = hello.clone();
-        thread::spawn(move || sender_loop(&r, hello, addr))
+        thread::spawn(move || serve_loop(&r, hello, listener))
     };
 
     let mut pushed: u64 = 0;
@@ -249,7 +244,7 @@ fn run<T: Activated>(mut cap: Capture<T>, opts: &Opts) -> Result<(), Box<dyn std
         }
     }
     ring.close();
-    let _ = sender.join();
+    let _ = server.join();
     eprintln!(
         "[seq-agent] done: {pushed} captured, {} dropped",
         ring.dropped()
@@ -264,7 +259,7 @@ struct Opts {
     input: Option<String>,
     filter: String,
     snaplen: u32,
-    to: String,
+    listen: String,
     ring: usize,
     promisc: bool,
 }
@@ -282,7 +277,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut input = None;
     let mut filter = String::new();
     let mut snaplen: u32 = 65535;
-    let mut to = None;
+    let mut listen = "0.0.0.0:9099".to_string();
     let mut ring: usize = 8192;
     let mut promisc = true;
 
@@ -292,7 +287,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
             "--input" => input = Some(next(&mut args, &a)?),
             "-f" | "--filter" => filter = next(&mut args, &a)?,
             "-s" | "--snaplen" => snaplen = next(&mut args, &a)?.parse()?,
-            "--to" => to = Some(next(&mut args, &a)?),
+            "-l" | "--listen" => listen = next(&mut args, &a)?,
             "--ring" => ring = next(&mut args, &a)?.parse()?,
             "--no-promisc" => promisc = false,
             "--list-devices" => {
@@ -309,7 +304,6 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let to = to.ok_or("missing --to <host:port>")?;
     if device.is_some() == input.is_some() {
         return Err("specify exactly one of --device <name> or --input <file.pcap>".into());
     }
@@ -318,7 +312,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         input,
         filter,
         snaplen,
-        to,
+        listen,
         ring,
         promisc,
     };
@@ -345,15 +339,16 @@ fn next(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, S
 fn print_usage() {
     eprint!(
         "seq-agent — capture forwarder (SEQA protocol)\n\n\
+         The agent listens; the daemon dials in and drains the frame stream.\n\n\
          USAGE:\n  \
-           seq-agent --to HOST:PORT (-i DEVICE | --input FILE.pcap) [options]\n\n\
+           seq-agent (-i DEVICE | --input FILE.pcap) [--listen HOST:PORT] [options]\n\n\
          OPTIONS:\n  \
            -i, --device NAME     capture from a live device\n      \
                --input FILE      read frames from a .pcap file instead\n  \
            -f, --filter BPF      BPF capture filter (e.g. 'udp')\n  \
-           -s, --snaplen N       capture length (default 65535)\n      \
-               --to HOST:PORT    consumer address to forward to (required)\n      \
-               --ring N          buffered frames while (re)connecting (default 8192)\n      \
+           -s, --snaplen N       capture length (default 65535)\n  \
+           -l, --listen HOST:PORT  address to accept a daemon on (default 0.0.0.0:9099)\n      \
+               --ring N          frames buffered while no daemon is connected (default 8192)\n      \
                --no-promisc      disable promiscuous mode\n      \
                --list-devices    list capture devices and exit\n  \
            -h, --help            show this help\n"

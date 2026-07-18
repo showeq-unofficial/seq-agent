@@ -1,19 +1,21 @@
 //! seq-sink — a tiny SEQA consumer for testing seq-agent end to end.
 //!
-//! Listens for a seq-agent connection, parses the SEQA hello + frame stream,
+//! Dials a seq-agent (which listens), parses the SEQA hello + frame stream,
 //! prints per-connection stats, and can reconstruct the captured frames into a
 //! `.pcap` file (`--write-pcap`) to prove the round-trip is byte-faithful.
-//! It is also the seed of the eventual daemon-side frame reader.
+//! It is also the seed of the eventual daemon-side frame reader — the daemon is
+//! the party that dials the agent.
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::time::Instant;
+use std::net::TcpStream;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use seq_agent::proto::{FrameHeader, Hello, MAX_CAPLEN};
 
 struct Opts {
-    listen: String,
+    connect: String,
     write_pcap: Option<String>,
 }
 
@@ -26,36 +28,54 @@ fn main() {
 
 fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let mut listen = "127.0.0.1:9099".to_string();
+    let mut connect = "127.0.0.1:9099".to_string();
     let mut write_pcap = None;
     while let Some(a) = args.next() {
         match a.as_str() {
-            "-l" | "--listen" => listen = args.next().ok_or("--listen needs a value")?,
+            "-c" | "--connect" => connect = args.next().ok_or("--connect needs a value")?,
             "--write-pcap" => write_pcap = Some(args.next().ok_or("--write-pcap needs a value")?),
             "-h" | "--help" => {
-                eprintln!("seq-sink --listen HOST:PORT [--write-pcap FILE]");
+                eprintln!("seq-sink --connect HOST:PORT [--write-pcap FILE]");
                 return Ok(());
             }
             other => return Err(format!("unknown argument: {other}").into()),
         }
     }
-    let opts = Opts { listen, write_pcap };
+    let opts = Opts {
+        connect,
+        write_pcap,
+    };
 
-    let listener = TcpListener::bind(&opts.listen)?;
-    println!("[seq-sink] listening on {}", opts.listen);
-    for stream in listener.incoming() {
-        match stream {
-            Ok(s) => {
-                let peer = s.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-                println!("[seq-sink] connection from {peer}");
-                if let Err(e) = handle(s, &opts) {
-                    eprintln!("[seq-sink] connection ended: {e}");
-                }
-            }
-            Err(e) => eprintln!("[seq-sink] accept error: {e}"),
-        }
+    // Dial the agent, retrying so it doesn't matter which side starts first.
+    println!("[seq-sink] connecting to {}", opts.connect);
+    let stream = connect_with_retry(&opts.connect);
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    println!("[seq-sink] connected to {peer}");
+    if let Err(e) = handle(stream, &opts) {
+        eprintln!("[seq-sink] connection ended: {e}");
     }
     Ok(())
+}
+
+/// Connect to the agent, retrying with backoff until it accepts. Blocks forever
+/// (Ctrl-C to give up) — mirrors the agent's willingness to wait for a daemon.
+fn connect_with_retry(addr: &str) -> TcpStream {
+    let mut backoff = Duration::from_millis(200);
+    loop {
+        match TcpStream::connect(addr) {
+            Ok(s) => {
+                let _ = s.set_nodelay(true);
+                return s;
+            }
+            Err(_) => {
+                thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
 }
 
 fn handle(stream: TcpStream, opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
