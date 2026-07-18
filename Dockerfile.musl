@@ -45,5 +45,8 @@ ENV LIBPCAP_LIBDIR=/opt/libpcap/lib \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --target "${TARGET}" --bin seq-agent \
+# `-lgcc` resolves libpcap's out-of-line __sync_synchronize on armv7 (the barrier
+# is inlined on aarch64/x86_64, so this is a harmless no-op there).
+RUN RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-lgcc" \
+    cargo build --release --target "${TARGET}" --bin seq-agent \
  && cp "target/${TARGET}/release/seq-agent" /seq-agent
