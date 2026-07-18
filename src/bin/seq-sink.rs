@@ -12,10 +12,11 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use seq_agent::proto::{FrameHeader, Hello, MAX_CAPLEN};
+use seq_agent::proto::{ClientHello, FrameHeader, Hello, MAX_CAPLEN};
 
 struct Opts {
     connect: String,
+    filter: Option<String>,
     write_pcap: Option<String>,
 }
 
@@ -29,13 +30,15 @@ fn main() {
 fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut connect = "127.0.0.1:9099".to_string();
+    let mut filter = None;
     let mut write_pcap = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "-c" | "--connect" => connect = args.next().ok_or("--connect needs a value")?,
+            "-f" | "--filter" => filter = Some(args.next().ok_or("--filter needs a value")?),
             "--write-pcap" => write_pcap = Some(args.next().ok_or("--write-pcap needs a value")?),
             "-h" | "--help" => {
-                eprintln!("seq-sink --connect HOST:PORT [--write-pcap FILE]");
+                eprintln!("seq-sink --connect HOST:PORT [--filter BPF] [--write-pcap FILE]");
                 return Ok(());
             }
             other => return Err(format!("unknown argument: {other}").into()),
@@ -43,6 +46,7 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let opts = Opts {
         connect,
+        filter,
         write_pcap,
     };
 
@@ -54,6 +58,16 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|a| a.to_string())
         .unwrap_or_default();
     println!("[seq-sink] connected to {peer}");
+
+    // Tell the agent what to capture (before it replies with its Hello). Omitted
+    // when no --filter, so a file-replay agent stays byte-faithful.
+    if let Some(f) = &opts.filter {
+        let mut s = &stream;
+        ClientHello { filter: f.clone() }.write_to(&mut s)?;
+        s.flush()?;
+        println!("[seq-sink] requested filter {f:?}");
+    }
+
     if let Err(e) = handle(stream, &opts) {
         eprintln!("[seq-sink] connection ended: {e}");
     }

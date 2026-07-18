@@ -2,18 +2,20 @@ Standalone capture forwarder for the ShowEQ daemon. Own git repo (NOT part of th
 
 What it is: a deliberately dumb pipe — open a pcap device (or read a `.pcap`), apply a BPF filter, ship timestamped raw frames over TCP. No decode, no state, no protocol knowledge, so it never needs updating on patch day. Two frontends to the same frame stream: live device and `--input file.pcap` replay.
 
-Connection direction: **the agent listens (`--listen`, default `0.0.0.0:9099`); the daemon dials in.** The agent is zero-config about topology — you point the daemon at the agent, not the other way round — so a fleet of agents all run the same argless command and the daemon owns the wiring. Data still flows agent→daemon; only who opens the TCP socket flipped. One daemon at a time (single ring, single consumer); the agent keeps capturing across a disconnect and serves the next daemon that connects. Multi-daemon fan-out is still future work.
+Connection direction: **the agent listens (`--listen`, default `0.0.0.0:9099`); the daemon dials in.** The agent is zero-config about topology — you point the daemon at the agent, not the other way round — so a fleet of agents all run the same argless command and the daemon owns the wiring. Data still flows agent→daemon; only who opens the TCP socket flipped. One daemon at a time; the live device is served on-demand (see below). Multi-daemon fan-out is still future work.
+
+Filter handshake (ported from scry's `Scry.Agent`): **the daemon tells the agent what to capture.** On a live device the agent is an on-demand tap — it opens the capture *when a daemon connects*, using the BPF filter that daemon names in a `ClientHello` (SEQC magic, daemon→agent, sent before the agent's `Hello`), and closes it on disconnect. If no ClientHello arrives within `HELLO_TIMEOUT` (2 s, matches scry) the agent falls back to its own `--filter` default. `seq-sink --filter <BPF>` sends the ClientHello; no `--filter` sends none. `--input` file replay is a "fixed source" — it ignores the ClientHello and replays the whole file (the agent's own `--filter`, if set, still narrows it), so round-trips stay byte-faithful. Consequence vs. the old always-on ring: the live agent no longer captures before a daemon connects (it can't know the filter yet), so there's no cross-reconnect buffering.
 
 Deliberate choices (don't "modernize" without reason):
 - **std threads, no tokio.** A single-connection linear capture→ring→send pipe needs no async runtime; `pcap` is blocking anyway. Keeps the static binary tiny (the router/UDM deploy goal). Revisit only if the agent grows multi-daemon fan-out or a control channel.
 - **`opt-level=z` + LTO + strip + panic=abort** in release — smallest binary is the point.
 
 Layout:
-- `src/proto.rs` — the SEQA wire format (the spec IS this file). Hello + pcap-shaped frame records, all little-endian. Pcap-shaped on purpose so `seq-sink --write-pcap` round-trips with no transformation.
-- `src/bin/seq-agent.rs` — the forwarder (needs `pcap`/libpcap).
-- `src/bin/seq-sink.rs` — pure-std test consumer; parses SEQA, prints stats, optionally rebuilds a `.pcap`. Seed of the eventual daemon-side reader.
+- `src/proto.rs` — the SEQA wire format (the spec IS this file). `ClientHello` (daemon→agent filter request) + `Hello` + pcap-shaped frame records, all little-endian. Pcap-shaped on purpose so `seq-sink --write-pcap` round-trips with no transformation. Codec round-trip tests live here.
+- `src/bin/seq-agent.rs` — the forwarder (needs `pcap`/libpcap). Per-session: capture thread fills the ring, sender thread writes the `Hello` + drains it; `read_client_hello` (loopback-tested) resolves the filter.
+- `src/bin/seq-sink.rs` — pure-std test consumer; dials the agent, optionally sends a `--filter` ClientHello, parses SEQA, prints stats, optionally rebuilds a `.pcap`. Seed of the eventual daemon-side reader.
 
-Ring semantics: `--input` (file) = lossless backpressure (faithful replay); live device = bounded drop-oldest (never stalls the NIC). The capture thread fills the ring the whole time; the serve thread accepts a daemon and drains it. While no daemon is connected the ring keeps buffering (drop-oldest for live), so a brief daemon reconnect doesn't lose the freshest frames. `seq-sink` (the consumer) is the side that dials with backoff — start either process first.
+Ring semantics (per session): `--input` (file) = lossless backpressure (faithful replay); live device = bounded drop-oldest (never stalls the NIC). The capture thread fills the ring; the sender drains it to the socket and closes the ring on daemon disconnect (which stops the capture). `seq-sink` (the consumer) is the side that dials with backoff — start either process first.
 
 Build: `(cd /home/rschultz/src/showeq/seq-agent && cargo build --release)`. Needs `libpcap.so` (libpcap0.8-dev) to link.
 

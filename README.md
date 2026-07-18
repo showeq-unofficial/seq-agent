@@ -9,11 +9,17 @@ router vantage point (sees every box's traffic) or on the game host itself; the
 daemon treats an agent connection, in-process pcap, and `.pcap`/`.vpk` replay as
 three frontends to the same frame stream.
 
-**The agent listens; the daemon dials in.** `seq-agent` binds a port
-(`--listen`, default `0.0.0.0:9099`) and waits — it needs no idea where the
-daemon lives. You point the daemon at the agent instead, so a fleet of agents
-all run the same argless command and the daemon owns the topology. (Data still
-flows agent→daemon; only who opens the socket changed.)
+**The agent listens; the daemon dials in and says what to capture.** `seq-agent`
+binds a port (`--listen`, default `0.0.0.0:9099`) and waits — it needs no idea
+where the daemon lives or what traffic to grab. When a daemon connects it sends a
+hello naming the BPF filter, and the (dumb) live agent opens its capture then and
+there — an on-demand tap: capture starts on connect and stops on disconnect. If
+the daemon names no filter, the agent falls back to its own `--filter` default.
+You point the daemon at the agent, so a fleet of agents all run the same argless
+command and the daemon owns the topology. (Data still flows agent→daemon.)
+
+A `.pcap` replay (`--input`) is a fixed source: it ignores the daemon's filter
+and replays the file faithfully.
 
 Deliberately built on std threads (no async runtime) so the release binary stays
 tiny — the goal is a static musl build that runs on a UDM / travel router.
@@ -38,23 +44,25 @@ Reading from a `.pcap` file needs no privileges.
 ## Usage
 
 ```sh
-# capture live UDP and wait for a daemon to connect (listens on 0.0.0.0:9099)
-seq-agent -i eth0 -f 'udp'
+# tap a live device and wait for a daemon (listens on 0.0.0.0:9099).
+# no filter here — the connecting daemon chooses it (see below)
+seq-agent -i eth0
 
-# bind an explicit address / port
+# -f sets the FALLBACK filter, used only if the daemon's hello omits one
 seq-agent -i eth0 -f 'udp' --listen 0.0.0.0:9099
 
-# or serve a capture file through the same pipe
+# or serve a capture file through the same pipe (ignores the daemon's filter)
 seq-agent --input capture.pcap --listen 127.0.0.1:9099
 
 seq-agent --list-devices        # list capture devices
 seq-agent --help
 ```
 
-The daemon (`seq-sink` here) connects to the agent:
+The daemon (`seq-sink` here) connects to the agent and names the filter it wants
+the agent to capture with:
 
 ```sh
-seq-sink --connect <agent-host>:9099
+seq-sink --connect <agent-host>:9099 --filter 'udp and portrange 9000-9010'
 ```
 
 ## Try it end to end (no privileges needed)
@@ -95,8 +103,8 @@ agent listens; your dev box then connects the daemon to the router's LAN IP:
 scp dist/seq-agent-aarch64-unknown-linux-musl root@<udm-ip>:/tmp/seq-agent
 ssh root@<udm-ip> '/tmp/seq-agent --device br0 --no-promisc --listen 0.0.0.0:9099'
 
-# on the dev box:
-seq-sink --connect <udm-ip>:9099        # (the real daemon connects the same way)
+# on the dev box — the daemon picks the filter:
+seq-sink --connect <udm-ip>:9099 --filter 'udp'   # (the real daemon connects the same way)
 ```
 
 > The agent's listen port streams raw captured frames with no auth — bind it to
@@ -127,7 +135,12 @@ conscious trade-off vs. ShowEQ's classic off-box posture.)
 TCP, little-endian, pcap-shaped so a stream converts to/from a `.pcap` file with
 no transformation. Full spec: [`src/proto.rs`](src/proto.rs).
 
-| Message | Fields |
-|---------|--------|
-| **Hello** (once) | `magic "SEQA"` · `version u8` · `flags u8` · `link_type i32` · `snaplen u32` · `filt_len u16` · `filter [u8]` |
-| **Frame** (repeated) | `ts_micros u64` · `caplen u32` · `origlen u32` · `data [caplen]` |
+| Message | Direction | Fields |
+|---------|-----------|--------|
+| **ClientHello** (once, optional) | daemon → agent | `magic "SEQC"` · `version u8` · `flags u8` · `filt_len u16` · `filter [u8]` |
+| **Hello** (once) | agent → daemon | `magic "SEQA"` · `version u8` · `flags u8` · `link_type i32` · `snaplen u32` · `filt_len u16` · `filter [u8]` |
+| **Frame** (repeated) | agent → daemon | `ts_micros u64` · `caplen u32` · `origlen u32` · `data [caplen]` |
+
+The daemon opens with a `ClientHello` naming the BPF filter it wants; the agent
+applies it (or its `--filter` default), then replies with `Hello` (the link type
++ the filter actually used) and streams `Frame`s.
