@@ -26,8 +26,42 @@ jobs:
       - run: cargo test
       - run: cargo build --release
 
+  # Windows build against Npcap. The pcap crate link-binds wpcap (Npcap SDK
+  # import libs at build; wpcap.dll from an installed Npcap at runtime). No
+  # clean Linux cross-compile, so this runs natively on a windows runner.
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write   # attach the .exe to the GitHub Release on tags
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Npcap SDK (provides wpcap.lib to the linker)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://npcap.com/dist/npcap-sdk-1.13.zip -OutFile npcap-sdk.zip
+          Expand-Archive -Path npcap-sdk.zip -DestinationPath npcap-sdk
+          "LIB=$env:LIB;$PWD\npcap-sdk\Lib\x64" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Build (Npcap)
+        env:
+          LIBPCAP_VER: "1.10.4"   # skip the wpcap.dll version-probe (Npcap not installed on the runner)
+        run: cargo build --release --bin seq-agent
+      - name: Stage binary
+        shell: pwsh
+        run: Copy-Item target/release/seq-agent.exe seq-agent-x86_64-pc-windows-msvc.exe
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: seq-agent-x86_64-pc-windows-msvc
+          path: seq-agent-x86_64-pc-windows-msvc.exe
+          if-no-files-found: error
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: seq-agent-x86_64-pc-windows-msvc.exe
+
   # Static musl artifacts for routers. Runs on tags + manual dispatch only
-  # (the Docker + libpcap cross-build is heavy; PRs/master stay on `check`).
+  # (the Docker + libpcap cross-build is heavy; PRs/main stay on the fast jobs).
   cross:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     needs: check

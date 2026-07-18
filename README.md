@@ -79,6 +79,26 @@ scp dist/seq-agent-aarch64-unknown-linux-musl root@<udm-ip>:/tmp/seq-agent
 ssh root@<udm-ip> '/tmp/seq-agent --device br0 --no-promisc --to <dev-host>:9099'
 ```
 
+## Windows
+
+`seq-agent` runs on Windows via [Npcap](https://npcap.com) (the `pcap` crate
+uses the same API and BPF compiler as libpcap). CI builds `seq-agent.exe` on
+every push and attaches it to tagged releases. The exe is **not** self-contained
+— it loads `wpcap.dll` at runtime, so:
+
+- **To run it:** install [Npcap](https://npcap.com/#download) (Wireshark's driver;
+  during install, leave *"Restrict Npcap driver's access to Administrators only"*
+  unchecked if you want non-admin capture). It can also capture loopback.
+- **To build it yourself:** install the [Npcap SDK](https://npcap.com/#download)
+  and add its `Lib\x64` folder to your `LIB` environment variable, then
+  `cargo build --release --bin seq-agent`.
+
+On a switched network a Windows host sees only its own traffic, so the natural
+place for a Windows agent is *on the EQ game box itself* — each box forwards to
+one daemon, no router/mirror involvement. (That does put a capture process +
+driver on the game machine, a conscious trade-off vs. ShowEQ's classic off-box
+posture.)
+
 ## SEQA wire protocol
 
 TCP, little-endian, pcap-shaped so a stream converts to/from a `.pcap` file with
