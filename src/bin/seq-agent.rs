@@ -16,8 +16,8 @@
 //! backpressures instead (faithful replay) and ignores the ClientHello.
 
 use std::collections::VecDeque;
-use std::io::{self, BufWriter, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, BufWriter, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -156,11 +156,35 @@ fn send_session(sock: TcpStream, hello: Hello, ring: &Ring) {
         .and_then(|_| pump(&mut w, ring));
     match res {
         // pump returns Ok only once the ring is closed and drained — a file
-        // replay that ran to completion.
-        Ok(()) => eprintln!("[seq-agent] all frames delivered"),
+        // replay that ran to completion. The peer is still connected, so close
+        // gracefully rather than dropping the socket outright.
+        Ok(()) => {
+            eprintln!("[seq-agent] all frames delivered");
+            if let Ok(stream) = w.into_inner() {
+                graceful_close(stream);
+            }
+        }
         Err(e) => eprintln!("[seq-agent] daemon disconnected: {e}"),
     }
     ring.close();
+}
+
+/// Half-close our write side (FIN), then drain whatever the peer sent us — a
+/// daemon opens with a ClientHello that a file replay never reads, and dropping
+/// a socket with unread data makes the OS send RST instead of FIN. An RST
+/// discards frames still sitting unread in a slow consumer's socket buffer, so
+/// it silently truncates the capture; draining first guarantees a clean FIN.
+fn graceful_close(stream: TcpStream) {
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut buf = [0u8; 1024];
+    loop {
+        match (&stream).read(&mut buf) {
+            Ok(0) => break,    // peer closed: FIN exchanged, clean
+            Ok(_) => continue, // discard (the unread ClientHello, etc.)
+            Err(_) => break,   // timeout/error: drained what was buffered
+        }
+    }
 }
 
 fn pump<W: Write>(w: &mut W, ring: &Ring) -> io::Result<()> {
